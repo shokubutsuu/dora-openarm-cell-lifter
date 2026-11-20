@@ -16,9 +16,11 @@
 
 import argparse
 import dora
+import fcntl
 import openarm_can as oa
 import math
 import os
+import signal
 import time
 
 import pyarrow as pa
@@ -43,6 +45,44 @@ JOYSTICK_RANGE = 0.85
 
 # Torque threshold for anomaly detection (collision / mechanical limit)
 TORQUE_LIMIT = 1.5
+
+
+class _Terminated(Exception):
+    """SIGTERM arrived; dora sends it 10 s after Ctrl-C, SIGKILL 5 s later."""
+
+
+def _raise_terminated(signum, frame):
+    raise _Terminated()
+
+
+def _acquire_lock(path):
+    """Hold an exclusive flock on `path` until exit, or return None.
+
+    Arm nodes started with `--wait-lock` on the same file hold their
+    position until it is released, so they never go limp above a lifter
+    that is still moving. The kernel releases it however this process ends.
+    """
+    if not path:
+        return None
+    lock = open(path, "a")  # noqa: SIM115 (held until exit)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"[LIFTER] {path} is held by another process; not locking it", flush=True)
+        lock.close()
+        return None
+    return lock
+
+
+def _hold_here(lifter):
+    """Stop the lifter at its current position instead of continuing a move."""
+    lifter.recv_all()
+    for motor in lifter.get_arm().get_motors():
+        lifter.get_arm().posvel_control_all(
+            [oa.PosVelParam(q=motor.get_position(), dq=VEL_MAX / 5.0)]
+        )
+    lifter.recv_all()
+    print("[LIFTER] Stopped before reaching the bottom; holding here", flush=True)
 
 
 class PositionUnwrapper:
@@ -446,6 +486,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--lock-file",
+        default=os.getenv("LOCK_FILE") or None,
+        help=(
+            "Hold an exclusive flock on this file until the lifter has come down "
+            "or stopped on exit (default: none)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=False,
@@ -472,10 +520,42 @@ def main():
     lifter.enable_all()
     lifter.recv_all()
 
-    _dora_main(lifter, args)
+    lock = _acquire_lock(args.lock_file)  # noqa: F841 (held until exit)
+    signal.signal(signal.SIGTERM, _raise_terminated)
+    homed = False
+    try:
+        _dora_main(lifter, args)
+        homed = _home(lifter, args)
+    except _Terminated:
+        pass
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if homed:
+            # Disable motors for safety after exiting the loop
+            lifter.disable_all()
+        else:
+            _hold_here(lifter)
 
-    # Move the lifter down to the mechanical stop before disabling
+
+# Shutdown homing runs once per this many seconds, like the 250 Hz tick
+# that paces calibration.
+HOMING_PERIOD_S = 0.004
+
+
+def _home(lifter, args):
+    """Move the lifter down to the mechanical stop; return whether it got there.
+
+    Gives up after the time a full stroke takes plus a margin, e.g. when the
+    motor has lost power and its torque never rises.
+    """
+    full_stroke_s = (args.screw_length / args.lead_length) * 2.0 * math.pi / (
+        VEL_MAX / 5.0
+    )
+    limit_s = full_stroke_s * 1.1 + 2.0
+    print(f"[LIFTER] Homing to the bottom (limit {limit_s:.0f} s)", flush=True)
+    started = time.monotonic()
     homing_tick = 0
+    next_report_s = 0.0
     while True:
         lifter.get_arm().posvel_control_all(
             [oa.PosVelParam(q=POS_MIN - 1000.0, dq=VEL_MAX / 5.0)]
@@ -492,12 +572,26 @@ def main():
                     f"[HOMING tick={homing_tick}]   pos={lifter_pos:.4f} rad  tau={lifter_tau:.4f} Nm  (threshold={CALIB_TORQUE_LIMIT})",
                     flush=True,
                 )
+        elapsed = time.monotonic() - started
+        if elapsed >= next_report_s:
+            print(
+                f"[LIFTER] Homing {elapsed:.0f} s: pos={lifter_pos:.4f} rad, "
+                f"tau={lifter_tau:.4f} Nm",
+                flush=True,
+            )
+            next_report_s += 5.0
         if abs(lifter_tau) > CALIB_TORQUE_LIMIT:
-            break
-        # stops the shutdown homing when abs(lifter_tau) > CALIB_TORQUE_LIMIT
-
-    # Disable motors for safety after exiting the loop
-    lifter.disable_all()
+            # stops the shutdown homing when abs(lifter_tau) > CALIB_TORQUE_LIMIT
+            print(f"[LIFTER] Reached the bottom after {elapsed:.1f} s", flush=True)
+            return True
+        if elapsed >= limit_s:
+            print(
+                f"[LIFTER] Did not reach the bottom in {elapsed:.0f} s "
+                f"(pos={lifter_pos:.4f} rad, tau={lifter_tau:.4f} Nm)",
+                flush=True,
+            )
+            return False
+        time.sleep(HOMING_PERIOD_S)
 
 
 if __name__ == "__main__":
