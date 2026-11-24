@@ -113,9 +113,9 @@ class BottomDetector:
 
 
 class PositionUnwrapper:
-    """Class to handle wrap-around of the DM4310's position feedback (+-12.5 rad)."""
+    """Class to handle wrap-around of multi-turn motor encoders (-4pi to 4pi)."""
 
-    def __init__(self, wrap_range=25.0, wrap_threshold=12.5):
+    def __init__(self, wrap_range=8.0 * math.pi, wrap_threshold=4.0 * math.pi):
         """Initialize the tracker for wrapped encoder positions."""
         self._wrap_range = wrap_range
         self._wrap_threshold = wrap_threshold
@@ -290,10 +290,7 @@ def _dora_main(lifter, args):
                 )
 
             if bottom.update(time.monotonic(), lifter_tau):
-                # Start unwrapping from this same reading: if the next one
-                # wrapped (the bottom can be near +-12.5 rad), it would be
-                # 25 rad (20 mm) off.
-                offset_pos = unwrapper.update(lifter_pos)
+                offset_pos = lifter_pos
                 calibrated = True
                 # With a start elevation, move there and hold it, like the
                 # arms' start pose, until the first lifter command. Without
