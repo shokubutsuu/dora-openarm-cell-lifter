@@ -113,9 +113,16 @@ class BottomDetector:
 
 
 class PositionUnwrapper:
-    """Class to handle wrap-around of multi-turn motor encoders (-4pi to 4pi)."""
+    """Turn the motor's position reading into a continuous position.
 
-    def __init__(self, wrap_range=8.0 * math.pi, wrap_threshold=4.0 * math.pi):
+    The DM4310 reports its angle only from -12.5 to +12.5 rad. Past either
+    end the reading jumps to the other end, like a clock hand passing 12,
+    so it repeats every 25 rad: about 4 turns, or 20 mm of lift with a
+    5 mm lead. Count those jumps to know how far the lifter has really
+    moved.
+    """
+
+    def __init__(self, wrap_range=25.0, wrap_threshold=12.5):
         """Initialize the tracker for wrapped encoder positions."""
         self._wrap_range = wrap_range
         self._wrap_threshold = wrap_threshold
@@ -290,7 +297,12 @@ def _dora_main(lifter, args):
                 )
 
             if bottom.update(time.monotonic(), lifter_tau):
-                offset_pos = lifter_pos
+                # Take the zero from the same reading the unwrapper starts
+                # from. If it started from the next reading instead, and the
+                # bottom sits right at the jump (e.g. -12.49 here, +12.49
+                # next), it would not see the jump and the height would read
+                # 25 rad (20 mm) at the bottom.
+                offset_pos = unwrapper.update(lifter_pos)
                 calibrated = True
                 # With a start elevation, move there and hold it, like the
                 # arms' start pose, until the first lifter command. Without

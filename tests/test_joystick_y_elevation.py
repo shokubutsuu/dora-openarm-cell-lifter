@@ -98,3 +98,9 @@ def test_bottom_reached_during_the_settle_time_is_taken_after_it():
     first = next(t for t in times if bottom.update(t, -1.2))
     assert main_module.CALIB_SETTLE_S <= first < main_module.CALIB_SETTLE_S + 0.05
 
+
+def test_unwrapper_follows_a_wrap_of_the_feedback():
+    unwrapper = main_module.PositionUnwrapper()
+    unwrapper.update(-12.4)
+    assert unwrapper.update(12.4) == pytest.approx(-12.6)
+    assert unwrapper.update(-12.4) == pytest.approx(-12.4)
