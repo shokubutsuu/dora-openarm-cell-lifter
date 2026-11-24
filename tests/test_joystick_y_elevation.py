@@ -72,3 +72,29 @@ def test_start_elevation_is_off_or_clamped_to_the_stroke(value, expected):
 def test_start_elevation_rejects_other_text():
     with pytest.raises(ValueError):
         main_module._start_elevation("bottom", screw_length=300.0)
+
+
+def test_bottom_ignores_the_reversal_spike_after_the_runway():
+    # The two runs that calibrated at the runway position: one ~1 Nm sample
+    # 8 ms into the descent.
+    bottom = main_module.BottomDetector(started=0.0)
+    assert not bottom.update(0.004, -0.24)
+    assert not bottom.update(0.008, -1.02)
+
+
+def test_bottom_needs_the_torque_to_stay_over_the_limit():
+    bottom = main_module.BottomDetector(started=0.0)
+    t = main_module.CALIB_SETTLE_S
+    samples = [1.0] * (main_module.CALIB_CONFIRM_SAMPLES - 1) + [0.1] + [1.0] * main_module.CALIB_CONFIRM_SAMPLES
+    results = [bottom.update(t + i * 0.004, tau) for i, tau in enumerate(samples)]
+    assert results.index(True) == len(samples) - 1
+
+
+def test_bottom_reached_during_the_settle_time_is_taken_after_it():
+    # Starting at the bottom, the short descent can hit it within the settle
+    # time; it keeps pushing, so it is taken once the settle time is over.
+    bottom = main_module.BottomDetector(started=0.0)
+    times = [i * 0.004 for i in range(200)]
+    first = next(t for t in times if bottom.update(t, -1.2))
+    assert main_module.CALIB_SETTLE_S <= first < main_module.CALIB_SETTLE_S + 0.05
+

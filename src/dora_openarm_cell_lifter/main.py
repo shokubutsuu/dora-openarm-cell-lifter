@@ -38,6 +38,16 @@ START_REACHED_RAD = 0.1
 # Used for calibration and homing
 CALIB_TORQUE_LIMIT = 0.7
 
+# Calibration first moves up for RUNWAY_S, toward a far target so the move
+# does not depend on the motor's position frame, then drives down. The
+# torque of reversing (and of the runway stopping) is not the bottom, so
+# it is ignored for CALIB_SETTLE_S, and the bottom is only taken once the
+# torque has stayed over CALIB_TORQUE_LIMIT for CALIB_CONFIRM_SAMPLES in a
+# row. Without this a single ~1 Nm sample 8 ms in was taken for the bottom.
+RUNWAY_S = 0.3
+CALIB_SETTLE_S = 0.3
+CALIB_CONFIRM_SAMPLES = 5
+
 # Threshold for joystick deadzone
 JOYSTICK_DEADZONE = 0.15
 # Scaling factor for velocity calculation (1.0 - 0.15)
@@ -83,6 +93,23 @@ def _hold_here(lifter):
         )
     lifter.recv_all()
     print("[LIFTER] Stopped before reaching the bottom; holding here", flush=True)
+
+
+class BottomDetector:
+    """Decide when the calibration descent has reached the bottom stop."""
+
+    def __init__(self, started):
+        """Start watching a descent that began at monotonic time `started`."""
+        self._started = started
+        self._over = 0
+
+    def update(self, now, torque):
+        """Return whether the bottom is reached, given a new torque sample."""
+        if now - self._started < CALIB_SETTLE_S or abs(torque) <= CALIB_TORQUE_LIMIT:
+            self._over = 0
+            return False
+        self._over += 1
+        return self._over >= CALIB_CONFIRM_SAMPLES
 
 
 class PositionUnwrapper:
@@ -194,11 +221,19 @@ def _dora_main(lifter, args):
             flush=True,
         )
 
-    # For calibration: give runway for torque sensing
+    # For calibration: give runway for torque sensing. Move up toward a far
+    # target for a moment: a nearby absolute target (formerly 2.0 rad) is
+    # anywhere on the stroke in the motor's own frame.
     lifter.get_arm().posvel_control_all(
-        [oa.PosVelParam(q=POS_MIN + 2.0, dq=VEL_MAX / 5.0)]
+        [oa.PosVelParam(q=POS_MIN + 1000.0, dq=VEL_MAX / 5.0)]
     )
-    time.sleep(1.0)
+    time.sleep(RUNWAY_S)
+    # Start down now rather than at the first event, which may come late,
+    # or the lifter would keep rising toward the far target.
+    lifter.get_arm().posvel_control_all(
+        [oa.PosVelParam(q=POS_MIN - 1000.0, dq=VEL_MAX / 5.0)]
+    )
+    bottom = BottomDetector(time.monotonic())
 
     for event in node:
         event_type = event["type"]
@@ -254,7 +289,7 @@ def _dora_main(lifter, args):
                     flush=True,
                 )
 
-            if abs(lifter_tau) > CALIB_TORQUE_LIMIT:
+            if bottom.update(time.monotonic(), lifter_tau):
                 offset_pos = lifter_pos
                 calibrated = True
                 # With a start elevation, move there and hold it, like the
