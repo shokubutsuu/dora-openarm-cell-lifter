@@ -587,6 +587,11 @@ def main():
 # Shutdown homing runs once per this many seconds, like the 250 Hz tick
 # that paces calibration.
 HOMING_PERIOD_S = 0.004
+# Shutdown homing gives up once the position has not moved this much for
+# this long without reaching the bottom, e.g. when the motor's power is off,
+# so the arms are not kept waiting for the whole stroke time.
+HOMING_STALL_RAD = 0.1
+HOMING_STALL_S = 5.0
 
 
 def _home(lifter, args):
@@ -601,6 +606,8 @@ def _home(lifter, args):
     limit_s = full_stroke_s * 1.1 + 2.0
     print(f"[LIFTER] Homing to the bottom (limit {limit_s:.0f} s)", flush=True)
     started = time.monotonic()
+    moved_at = started
+    moved_from = None
     homing_tick = 0
     next_report_s = 0.0
     while True:
@@ -619,7 +626,11 @@ def _home(lifter, args):
                     f"[HOMING tick={homing_tick}]   pos={lifter_pos:.4f} rad  tau={lifter_tau:.4f} Nm  (threshold={CALIB_TORQUE_LIMIT})",
                     flush=True,
                 )
-        elapsed = time.monotonic() - started
+        now = time.monotonic()
+        elapsed = now - started
+        if moved_from is None or abs(lifter_pos - moved_from) > HOMING_STALL_RAD:
+            moved_from = lifter_pos
+            moved_at = now
         if elapsed >= next_report_s:
             print(
                 f"[LIFTER] Homing {elapsed:.0f} s: pos={lifter_pos:.4f} rad, "
@@ -631,6 +642,14 @@ def _home(lifter, args):
             # stops the shutdown homing when abs(lifter_tau) > CALIB_TORQUE_LIMIT
             print(f"[LIFTER] Reached the bottom after {elapsed:.1f} s", flush=True)
             return True
+        if now - moved_at >= HOMING_STALL_S:
+            print(
+                f"[LIFTER] Did not reach the bottom: not moving for "
+                f"{HOMING_STALL_S:.0f} s (pos={lifter_pos:.4f} rad, "
+                f"tau={lifter_tau:.4f} Nm)",
+                flush=True,
+            )
+            return False
         if elapsed >= limit_s:
             print(
                 f"[LIFTER] Did not reach the bottom in {elapsed:.0f} s "

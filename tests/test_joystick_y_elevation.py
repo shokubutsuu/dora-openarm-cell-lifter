@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import types
+
 import pytest
 
 
@@ -104,3 +106,32 @@ def test_unwrapper_follows_a_wrap_of_the_feedback():
     unwrapper.update(-12.4)
     assert unwrapper.update(12.4) == pytest.approx(-12.6)
     assert unwrapper.update(-12.4) == pytest.approx(-12.4)
+
+
+class _StillLifter:
+    """A lifter whose motor reports the same position and no torque."""
+
+    def __init__(self):
+        self.motor = types.SimpleNamespace(
+            get_position=lambda: 1.0, get_torque=lambda: 0.0
+        )
+
+    def get_arm(self):
+        return types.SimpleNamespace(
+            posvel_control_all=lambda params: None, get_motors=lambda: [self.motor]
+        )
+
+    def recv_all(self):
+        pass
+
+
+def test_homing_gives_up_when_the_lifter_does_not_move(monkeypatch, capsys):
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        main_module.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s)
+    )
+    args = types.SimpleNamespace(screw_length=300.0, lead_length=5.0, debug=False)
+    assert main_module._home(_StillLifter(), args) is False
+    assert clock[0] == pytest.approx(main_module.HOMING_STALL_S, abs=0.01)
+    assert "not moving" in capsys.readouterr().out
