@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import types
+
 import pytest
 
 
@@ -72,3 +74,96 @@ def test_start_elevation_is_off_or_clamped_to_the_stroke(value, expected):
 def test_start_elevation_rejects_other_text():
     with pytest.raises(ValueError):
         main_module._start_elevation("bottom", screw_length=300.0)
+
+
+def test_bottom_ignores_the_reversal_spike_after_the_runway():
+    # The two runs that calibrated at the runway position: one ~1 Nm sample
+    # 8 ms into the descent.
+    bottom = main_module.BottomDetector(started=0.0)
+    assert not bottom.update(0.004, -0.24)
+    assert not bottom.update(0.008, -1.02)
+
+
+def test_bottom_needs_the_torque_to_stay_over_the_limit():
+    bottom = main_module.BottomDetector(started=0.0)
+    t = main_module.CALIB_SETTLE_S
+    samples = [1.0] * (main_module.CALIB_CONFIRM_SAMPLES - 1) + [0.1] + [1.0] * main_module.CALIB_CONFIRM_SAMPLES
+    results = [bottom.update(t + i * 0.004, tau) for i, tau in enumerate(samples)]
+    assert results.index(True) == len(samples) - 1
+
+
+def test_bottom_reached_during_the_settle_time_is_taken_after_it():
+    # Starting at the bottom, the short descent can hit it within the settle
+    # time; it keeps pushing, so it is taken once the settle time is over.
+    bottom = main_module.BottomDetector(started=0.0)
+    times = [i * 0.004 for i in range(200)]
+    first = next(t for t in times if bottom.update(t, -1.2))
+    assert main_module.CALIB_SETTLE_S <= first < main_module.CALIB_SETTLE_S + 0.05
+
+
+def test_unwrapper_follows_a_wrap_of_the_feedback():
+    unwrapper = main_module.PositionUnwrapper()
+    unwrapper.update(-12.4)
+    assert unwrapper.update(12.4) == pytest.approx(-12.6)
+    assert unwrapper.update(-12.4) == pytest.approx(-12.4)
+
+
+class _StillLifter:
+    """A lifter whose motor reports the same position and no torque."""
+
+    def __init__(self):
+        self.motor = types.SimpleNamespace(
+            get_position=lambda: 1.0, get_torque=lambda: 0.0
+        )
+
+    def get_arm(self):
+        return types.SimpleNamespace(
+            posvel_control_all=lambda params: None, get_motors=lambda: [self.motor]
+        )
+
+    def recv_all(self):
+        pass
+
+
+def test_homing_gives_up_when_the_lifter_does_not_move(monkeypatch, capsys):
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        main_module.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s)
+    )
+    args = types.SimpleNamespace(screw_length=300.0, lead_length=5.0, debug=False)
+    assert main_module._home(_StillLifter(), args) is False
+    assert clock[0] == pytest.approx(main_module.HOMING_STALL_S, abs=0.01)
+    assert "not moving" in capsys.readouterr().out
+
+
+class _RecordingLifter:
+    """A lifter that keeps the last target sent to it."""
+
+    def __init__(self):
+        self.sent = None
+
+    def get_arm(self):
+        return types.SimpleNamespace(posvel_control_all=self._send)
+
+    def _send(self, params):
+        (param,) = params
+        self.sent = (param.q, param.dq)
+
+
+@pytest.mark.parametrize(
+    ("position", "target", "expected"),
+    [
+        # Far from the target: full speed, toward a target beyond the stroke.
+        (10.0, 300.0, (main_module.FAR_RAD, 6.0)),
+        (300.0, 10.0, (-main_module.FAR_RAD, 6.0)),
+        # Close to it: slowing down.
+        (10.0, 10.2, (main_module.FAR_RAD, pytest.approx(1.0))),
+        # On it: holding still.
+        (10.0, 10.0, (-main_module.FAR_RAD, 0.0)),
+    ],
+)
+def test_drive_aims_far_and_sets_only_the_speed(position, target, expected):
+    lifter = _RecordingLifter()
+    main_module._drive(lifter, position, target, 6.0)
+    assert lifter.sent == expected
