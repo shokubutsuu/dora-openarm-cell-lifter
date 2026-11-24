@@ -135,3 +135,35 @@ def test_homing_gives_up_when_the_lifter_does_not_move(monkeypatch, capsys):
     assert main_module._home(_StillLifter(), args) is False
     assert clock[0] == pytest.approx(main_module.HOMING_STALL_S, abs=0.01)
     assert "not moving" in capsys.readouterr().out
+
+
+class _RecordingLifter:
+    """A lifter that keeps the last target sent to it."""
+
+    def __init__(self):
+        self.sent = None
+
+    def get_arm(self):
+        return types.SimpleNamespace(posvel_control_all=self._send)
+
+    def _send(self, params):
+        (param,) = params
+        self.sent = (param.q, param.dq)
+
+
+@pytest.mark.parametrize(
+    ("position", "target", "expected"),
+    [
+        # Far from the target: full speed, toward a target beyond the stroke.
+        (10.0, 300.0, (main_module.FAR_RAD, 6.0)),
+        (300.0, 10.0, (-main_module.FAR_RAD, 6.0)),
+        # Close to it: slowing down.
+        (10.0, 10.2, (main_module.FAR_RAD, pytest.approx(1.0))),
+        # On it: holding still.
+        (10.0, 10.0, (-main_module.FAR_RAD, 0.0)),
+    ],
+)
+def test_drive_aims_far_and_sets_only_the_speed(position, target, expected):
+    lifter = _RecordingLifter()
+    main_module._drive(lifter, position, target, 6.0)
+    assert lifter.sent == expected

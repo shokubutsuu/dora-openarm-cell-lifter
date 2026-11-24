@@ -27,8 +27,17 @@ import pyarrow as pa
 
 # --- Constants ---
 VEL_MAX = 30.0
-POS_MIN = 0.0
 HOLD_POS_VEL = 1.0
+
+# Every move aims at a target this far (rad) beyond the stroke (377 rad),
+# up or down, and sets only the speed. The motor takes targets in its own
+# multi-turn count, which can be whole 25 rad (20 mm) turns off from the
+# wrapped position it reports, so a target computed from the reading can
+# land 20 mm off; one this far lands on the right side on any count.
+FAR_RAD = 1000.0
+# Speed (rad/s) per rad of distance left when driving to a position, so a
+# move slows down and stops on it (at 0 rad/s the motor holds still).
+DRIVE_GAIN = 5.0
 
 # Speed of the move to the start elevation after calibration, and how close
 # (rad) counts as arrived, after which the position is held with HOLD_POS_VEL.
@@ -87,10 +96,7 @@ def _acquire_lock(path):
 def _hold_here(lifter):
     """Stop the lifter at its current position instead of continuing a move."""
     lifter.recv_all()
-    for motor in lifter.get_arm().get_motors():
-        lifter.get_arm().posvel_control_all(
-            [oa.PosVelParam(q=motor.get_position(), dq=VEL_MAX / 5.0)]
-        )
+    lifter.get_arm().posvel_control_all([oa.PosVelParam(q=FAR_RAD, dq=0.0)])
     lifter.recv_all()
     print("[LIFTER] Stopped before reaching the bottom; holding here", flush=True)
 
@@ -147,6 +153,19 @@ class PositionUnwrapper:
         self._continuous_pos += diff
         self._prev_raw = current_raw
         return self._continuous_pos
+
+
+def _drive(lifter, position, target, max_vel):
+    """Drive toward `target` from `position` (rad, same frame) for one tick.
+
+    Aims at FAR_RAD on the target's side and sets only the speed: up to
+    `max_vel`, slowing to 0 at the target. Call it every tick.
+    """
+    distance = target - position
+    vel = min(max_vel, DRIVE_GAIN * abs(distance))
+    lifter.get_arm().posvel_control_all(
+        [oa.PosVelParam(q=FAR_RAD if distance > 0 else -FAR_RAD, dq=vel)]
+    )
 
 
 def _start_elevation(value, screw_length):
@@ -228,17 +247,16 @@ def _dora_main(lifter, args):
             flush=True,
         )
 
-    # For calibration: give runway for torque sensing. Move up toward a far
-    # target for a moment: a nearby absolute target (formerly 2.0 rad) is
-    # anywhere on the stroke in the motor's own frame.
+    # For calibration: give runway for torque sensing by moving up for a
+    # moment.
     lifter.get_arm().posvel_control_all(
-        [oa.PosVelParam(q=POS_MIN + 1000.0, dq=VEL_MAX / 5.0)]
+        [oa.PosVelParam(q=FAR_RAD, dq=VEL_MAX / 5.0)]
     )
     time.sleep(RUNWAY_S)
     # Start down now rather than at the first event, which may come late,
     # or the lifter would keep rising toward the far target.
     lifter.get_arm().posvel_control_all(
-        [oa.PosVelParam(q=POS_MIN - 1000.0, dq=VEL_MAX / 5.0)]
+        [oa.PosVelParam(q=-FAR_RAD, dq=VEL_MAX / 5.0)]
     )
     bottom = BottomDetector(time.monotonic())
 
@@ -280,7 +298,7 @@ def _dora_main(lifter, args):
         # --- Calibration Phase ---
         if not calibrated:
             lifter.get_arm().posvel_control_all(
-                [oa.PosVelParam(q=POS_MIN - 1000.0, dq=VEL_MAX / 5.0)]
+                [oa.PosVelParam(q=-FAR_RAD, dq=VEL_MAX / 5.0)]
             )
 
             lifter.recv_all()
@@ -312,16 +330,12 @@ def _dora_main(lifter, args):
                 )
                 if start_elevation is not None:
                     hold_elevation = start_elevation
-                    hold_pos = (
-                        start_elevation / args.lead_length * 2.0 * math.pi + offset_pos
-                    )
+                    hold_pos = start_elevation / args.lead_length * 2.0 * math.pi
                     is_stopping = True
                     moving_to_start = True
                     # Stop pushing into the bottom now, or the torque reads
                     # as a jam on the next tick and cancels the start move.
-                    lifter.get_arm().posvel_control_all(
-                        [oa.PosVelParam(q=hold_pos, dq=START_MOVE_VEL)]
-                    )
+                    _drive(lifter, 0.0, hold_pos, START_MOVE_VEL)
                 if args.debug:
                     print(
                         f"[CALIB] Done! offset_pos={offset_pos:.4f} rad after {calib_tick} ticks. "
@@ -368,24 +382,25 @@ def _dora_main(lifter, args):
         # --- Elevation (mm) ---
         if event_id == "move_elevation":
             elevation = max(0.0, min(args.screw_length, value[0].as_py()))
-            target_position = elevation / args.lead_length * 2.0 * math.pi + offset_pos
-            is_stopping = False
+            # Drive there in the hold below, which runs every tick.
+            hold_pos = elevation / args.lead_length * 2.0 * math.pi
+            hold_elevation = elevation
+            is_stopping = True
+            moving_to_start = True
 
             node.send_output(
                 "elevation_action",
                 pa.array([elevation], type=pa.float32()),
             )
 
-            lifter.get_arm().posvel_control_all(
-                [oa.PosVelParam(q=target_position, dq=VEL_MAX * speed_factor)]
-            )
+            _drive(lifter, obs_position, hold_pos, VEL_MAX * speed_factor)
             continue
 
         # --- 1. Jam detection and direction memorization ---
         if abs(lifter_tau) > TORQUE_LIMIT:
             if jammed_direction is None:
                 # Memorize the exact position at impact to prevent hunting
-                hold_pos = obs_position + offset_pos  # Use the unwrapper position
+                hold_pos = obs_position  # Use the unwrapper position
                 hold_elevation = obs_elevation  # obs elevation is calculated from the unwrapper lifter_pos(hold_pos)
 
                 if joystick_y > JOYSTICK_DEADZONE:
@@ -415,9 +430,7 @@ def _dora_main(lifter, args):
                     "elevation_action",
                     pa.array([hold_elevation], type=pa.float32()),
                 )
-                lifter.get_arm().posvel_control_all(
-                    [oa.PosVelParam(q=hold_pos, dq=0.0)]
-                )
+                _drive(lifter, obs_position, hold_pos, 0.0)
 
             else:
                 action_elevation, applied_vel = _calc_elevation_action_from_joystick(
@@ -434,9 +447,7 @@ def _dora_main(lifter, args):
                 )
 
                 # Drive toward the top stroke limit (positive joystick_y = up)
-                lifter.get_arm().posvel_control_all(
-                    [oa.PosVelParam(q=pos_max + offset_pos, dq=applied_vel)]
-                )
+                _drive(lifter, obs_position, pos_max, applied_vel)
 
         # DOWN operation
         elif joystick_y < -JOYSTICK_DEADZONE:
@@ -448,9 +459,7 @@ def _dora_main(lifter, args):
                     "elevation_action",
                     pa.array([hold_elevation], type=pa.float32()),
                 )
-                lifter.get_arm().posvel_control_all(
-                    [oa.PosVelParam(q=hold_pos, dq=0.0)]
-                )
+                _drive(lifter, obs_position, hold_pos, 0.0)
             else:
                 action_elevation, applied_vel = _calc_elevation_action_from_joystick(
                     obs_elevation,
@@ -466,15 +475,13 @@ def _dora_main(lifter, args):
                 )
 
                 # Drive toward the bottom stroke limit (negative joystick_y = down)
-                lifter.get_arm().posvel_control_all(
-                    [oa.PosVelParam(q=offset_pos, dq=applied_vel)]
-                )
+                _drive(lifter, obs_position, 0.0, applied_vel)
 
         # STOP (Within deadzone)
         else:
             if not is_stopping:
                 # Memorize the exact position at the moment the joystick is released
-                hold_pos = obs_position + offset_pos  # Use the unwrapper position
+                hold_pos = obs_position  # Use the unwrapper position
                 hold_elevation = obs_elevation  # obs elevation is calculated from the unwrapper position(hold_pos)
                 is_stopping = True
 
@@ -482,16 +489,14 @@ def _dora_main(lifter, args):
                 "elevation_action",
                 pa.array([hold_elevation], type=pa.float32()),
             )
-            if moving_to_start and _reached(obs_position + offset_pos, hold_pos):
+            if moving_to_start and _reached(obs_position, hold_pos):
                 moving_to_start = False
             # Hold position with a small velocity to maintain stiffness, preventing drift due to gravity or disturbances
-            lifter.get_arm().posvel_control_all(
-                [
-                    oa.PosVelParam(
-                        q=hold_pos,
-                        dq=START_MOVE_VEL if moving_to_start else HOLD_POS_VEL,
-                    )
-                ]
+            _drive(
+                lifter,
+                obs_position,
+                hold_pos,
+                START_MOVE_VEL if moving_to_start else HOLD_POS_VEL,
             )
 
 
@@ -612,7 +617,7 @@ def _home(lifter, args):
     next_report_s = 0.0
     while True:
         lifter.get_arm().posvel_control_all(
-            [oa.PosVelParam(q=POS_MIN - 1000.0, dq=VEL_MAX / 5.0)]
+            [oa.PosVelParam(q=-FAR_RAD, dq=VEL_MAX / 5.0)]
         )
 
         lifter.recv_all()
